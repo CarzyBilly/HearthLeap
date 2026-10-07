@@ -1,0 +1,47 @@
+[
+  {
+    "name": "BepInEx-5.4.23.5-MIT.txt",
+    "url": "https://raw.githubusercontent.com/BepInEx/BepInEx/v5.4.23.5/LICENSE",
+    "sha256": "E6E534EF6F4347B6449407EE046A3D09CB0174C6F688C996AD0BED94B74B3933"
+  },
+  {
+    "name": "UnityDoorstop-4.5.0.txt",
+    "url": "https://raw.githubusercontent.com/NeighTools/UnityDoorstop/v4.5.0/LICENSE",
+    "sha256": "20C17D8B8C48A600800DFD14F95D5CB9FF47066A9641DDEAB48DC54AEC96E331"
+  },
+  {
+    "name": "HarmonyX-2.9.0-MIT.txt",
+    "url": "https://raw.githubusercontent.com/BepInEx/HarmonyX/v2.9.0/LICENSE",
+    "sha256": "7E54AB4766EF78637A05FB3454663A66DE6BB960DBD4C7088890ED76B0844F36"
+  },
+  {
+    "name": "Mono.Cecil-0.10.4-MIT.txt",
+    "url": "https://raw.githubusercontent.com/jbevain/cecil/0.10.4/LICENSE.txt",
+    "sha256": "13D58ECBED676511C0C4C4009BFF107025E50007FF5E7901DC562700EC62509E"
+  },
+  {
+    "name": "MonoMod-22.01.29.01-MIT.txt",
+    "url": "https://raw.githubusercontent.com/MonoMod/MonoMod/v22.01.29.01/LICENSE",
+    "sha256": "0B64833222E3C6A426AD29362D26334619FE02EAF2B89EA9C37805521896C920"
+  },
+  {
+    "name": "Mono-LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/mono/mono/main/LICENSE",
+    "sha256": "844242559DBDB96CB9CBE103B06C2BC8A349F19AD0B89D5C3CF830A8914333F6"
+  },
+  {
+    "name": "dotnet-runtime-MIT.txt",
+    "url": "https://raw.githubusercontent.com/dotnet/runtime/v10.0.9/LICENSE.TXT",
+    "sha256": "CFC21F5E8BD655AE997EEC916138B707B1D290B83272C02A95C9F821B8C87310"
+  },
+  {
+    "name": "dotnet-wpf-MIT.txt",
+    "url": "https://raw.githubusercontent.com/dotnet/wpf/v10.0.9/LICENSE.TXT",
+    "sha256": "AE48DF11A335DC1A615F4F938B69CBA73BCF4485C4F97AF49B38EFB0F216353B"
+  },
+  {
+    "name": "Harmony-MIT.txt",
+    "url": "https://raw.githubusercontent.com/pardeike/Harmony/master/LICENSE",
+    "sha256": "A5883D0C45EB7E176D3D1631220E7F96E958E37064773D40245AE6DB560BBD6D"
+  }
+]

@@ -1,0 +1,1609 @@
+// Migrated from user-provided HsAuto 0.8.21 source. See PROVENANCE.md.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using HsAuto.Core.Strategy;
+using Microsoft.Win32;
+
+namespace HsAuto.Core.Automation;
+public sealed class NeteaseBoxRecommendationSource : INeteaseBoxRecommendationSource, INeteaseBoxWinRateSource
+{
+    private struct MemoryBasicInformation
+    {
+        public nint BaseAddress;
+        public nint AllocationBase;
+        public uint AllocationProtect;
+        public ushort PartitionId;
+        public nuint RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    private struct SidAndAttributes
+    {
+        public nint Sid;
+        public uint Attributes;
+    }
+
+    private struct TokenMandatoryLabel
+    {
+        public SidAndAttributes Label;
+    }
+
+    private sealed record RendererScanResult(bool HasRecommendationCallback, bool HasWinRateCallback, IReadOnlyList<NeteaseBoxRecommendationObservation> Observations, IReadOnlyList<NeteaseBoxWinRateObservation> WinRateObservations, RendererScanDiagnostics Diagnostics)
+    {
+        public static RendererScanResult OpenProcessFailure(int win32Error)
+        {
+            return new RendererScanResult(HasRecommendationCallback: false, HasWinRateCallback: false, Array.Empty<NeteaseBoxRecommendationObservation>(), Array.Empty<NeteaseBoxWinRateObservation>(), new RendererScanDiagnostics(OpenProcessSucceeded: false, win32Error, 0, 0, 0, 0, Array.Empty<int>(), 0));
+        }
+    }
+
+    private sealed record RendererScanDiagnostics(bool OpenProcessSucceeded, int OpenProcessError, int QueriedRegionCount, int EligibleRegionCount, int ReadSuccessCount, int ReadFailureCount, IReadOnlyList<int> ReadErrorCodes, int CallbackRegionCount);
+    private sealed record ProcessIntegrityInfo(bool IsKnown, uint Rid, int Band, string Label, int Win32Error)
+    {
+        public string DisplayText
+        {
+            get
+            {
+                if (IsKnown)
+                {
+                    return $"{Label}(RID=0x{Rid:X})";
+                }
+
+                return $"未知(Win32={Win32Error})";
+            }
+        }
+
+        public static ProcessIntegrityInfo Unknown(int win32Error)
+        {
+            return new ProcessIntegrityInfo(IsKnown: false, 0u, -1, "未知", win32Error);
+        }
+
+        public static ProcessIntegrityInfo FromRid(uint rid)
+        {
+            if (rid < 16384)
+            {
+                if (rid < 8192)
+                {
+                    if (rid < 4096)
+                    {
+                        return new ProcessIntegrityInfo(IsKnown: true, rid, 0, "不受信任", 0);
+                    }
+
+                    return new ProcessIntegrityInfo(IsKnown: true, rid, 1, "低", 0);
+                }
+
+                if (rid < 12288)
+                {
+                    return new ProcessIntegrityInfo(IsKnown: true, rid, 2, "中等", 0);
+                }
+
+                return new ProcessIntegrityInfo(IsKnown: true, rid, 3, "高", 0);
+            }
+
+            if (rid < 20480)
+            {
+                return new ProcessIntegrityInfo(IsKnown: true, rid, 4, "系统", 0);
+            }
+
+            return new ProcessIntegrityInfo(IsKnown: true, rid, 5, "受保护", 0);
+        }
+    }
+
+    private sealed class ProcessCollection : IDisposable
+    {
+        public Process[] Processes { get; }
+
+        public ProcessCollection(Process[] processes)
+        {
+            Processes = processes;
+        }
+
+        public void Dispose()
+        {
+            Process[] processes = Processes;
+            for (int i = 0; i < processes.Length; i++)
+            {
+                processes[i].Dispose();
+            }
+        }
+    }
+
+    private const uint ProcessQueryInformation = 1024u;
+    private const uint ProcessQueryLimitedInformation = 4096u;
+    private const uint ProcessVmRead = 16u;
+    private const uint TokenQuery = 8u;
+    private const uint MemCommit = 4096u;
+    private const uint MemPrivate = 131072u;
+    private const uint PageGuard = 256u;
+    private const int TokenIntegrityLevel = 25;
+    private const int MaxReadableRegionBytes = 67108864;
+    private static readonly TimeSpan BindingConfirmationTimeout = TimeSpan.FromSeconds(8);
+    private static readonly object VerifiedBindingGate = new();
+    private static NeteaseBoxVerifiedSession _lastVerifiedBinding;
+    private static readonly TimeSpan DefaultRendererDiscoveryTimeout = TimeSpan.FromSeconds(20.0);
+    private static readonly TimeSpan RendererWarmupWindow = TimeSpan.FromSeconds(4.0);
+    private static readonly byte[] CallbackMarker = Encoding.ASCII.GetBytes("onUpdateLadderActionRecommend");
+    private static readonly byte[] CallbackMarkerUtf16 = Encoding.Unicode.GetBytes("onUpdateLadderActionRecommend");
+    private static readonly byte[] WinRateCallbackMarker = Encoding.ASCII.GetBytes("onUpdateWinrateData");
+    private static readonly byte[] WinRateCallbackMarkerUtf16 = Encoding.Unicode.GetBytes("onUpdateWinrateData");
+    private readonly SemaphoreSlim _scanGate = new SemaphoreSlim(1, 1);
+    private readonly HashSet<int> _rendererProcessIds = new HashSet<int>();
+    private readonly HashSet<int> _winRateRendererProcessIds = new HashSet<int>();
+    private readonly HashSet<int> _winRateCallbackCandidates = new HashSet<int>();
+    private readonly Dictionary<int, DateTimeOffset> _rendererCandidateScans = new Dictionary<int, DateTimeOffset>();
+    private readonly Dictionary<int, HashSet<ulong>> _payloadRegions = new Dictionary<int, HashSet<ulong>>();
+    private readonly Dictionary<int, HashSet<ulong>> _winRateRegions = new Dictionary<int, HashSet<ulong>>();
+    private readonly Dictionary<int, List<NeteaseBoxRecommendationObservation>> _latestByOptionId = new Dictionary<int, List<NeteaseBoxRecommendationObservation>>();
+    private readonly List<NeteaseBoxWinRateObservation> _latestWinRates = new List<NeteaseBoxWinRateObservation>();
+    private readonly Dictionary<string, DateTimeOffset> _memoryObservationFirstSeen = new Dictionary<string, DateTimeOffset>();
+    private readonly HashSet<int> _reportedRendererCandidates = new HashSet<int>();
+    private readonly Dictionary<(int ProcessId, string Scope), string> _rendererDiagnosticSignatures = new Dictionary<(int, string), string>();
+    private readonly bool _enableDiagnostics;
+    private readonly TimeSpan _rendererDiscoveryTimeout;
+    private string _boxRoot = "";
+    private string _boxExecutablePath = "";
+    private DateTimeOffset _initializedAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _recommendationEpoch = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastRendererDiscoveryAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastFullScanAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastWinRateScanAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastWinRateRelocationScanAt = DateTimeOffset.MinValue;
+    private int _winRateCaptureEnabled;
+    private int _boundHearthstoneProcessId;
+    public event Action<string>? Log;
+    public void SetRecommendationEpoch(DateTimeOffset epoch)
+    {
+        // Memory callbacks do not always carry a producer timestamp.  Their
+        // first-seen time is synthesized in NormalizeMemoryObservation.  Keep
+        // observations captured during the current startup window, but forget
+        // synthesized timestamps from an older match so an identical payload
+        // in the next match can be observed again instead of being filtered as
+        // historical.  Explicit callback timestamps are never rewritten.
+        if (epoch > _recommendationEpoch)
+        {
+            foreach (string key in _memoryObservationFirstSeen
+                .Where(pair => pair.Value < epoch)
+                .Select(pair => pair.Key)
+                .ToArray())
+            {
+                _memoryObservationFirstSeen.Remove(key);
+            }
+        }
+
+        _recommendationEpoch = epoch;
+    }
+
+    public void SetWinRateCaptureEnabled(bool enabled)
+    {
+        Volatile.Write(ref _winRateCaptureEnabled, enabled ? 1 : 0);
+    }
+
+    public IReadOnlyList<NeteaseBoxWinRateObservation> ReadCachedWinRates()
+    {
+        return _latestWinRates.ToArray();
+    }
+
+    public async Task RefreshWinRatesAsync(CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(in _winRateCaptureEnabled) == 0)
+        {
+            return;
+        }
+
+        await _scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            ValidateBindingBeforeRead();
+            RemoveExitedRenderers();
+            if (_winRateRendererProcessIds.Count == 0)
+            {
+                await Task.Run((Func<bool>)DiscoverRecommendationRenderers, cancellationToken);
+            }
+
+            await RefreshWinRateMemoryAsync(cancellationToken);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    public NeteaseBoxRecommendationSource(bool enableDiagnostics = false, TimeSpan? rendererDiscoveryTimeout = null)
+    {
+        _enableDiagnostics = enableDiagnostics;
+        _rendererDiscoveryTimeout = rendererDiscoveryTimeout ?? DefaultRendererDiscoveryTimeout;
+    }
+
+    public async Task InitializeAsync(int hearthstoneProcessId, CancellationToken cancellationToken)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new InvalidOperationException("盒子AI策略仅支持 Windows。");
+        }
+
+        string boxExecutable = await EnsureSingleNeteaseBoxProcessAsync(hearthstoneProcessId, cancellationToken);
+        await ValidateCurrentHelperTargetAsync(boxExecutable, hearthstoneProcessId, cancellationToken);
+        ResetScanState();
+        _boxExecutablePath = boxExecutable;
+        _boxRoot = Path.GetDirectoryName(boxExecutable) ?? "";
+        _initializedAt = DateTimeOffset.UtcNow;
+        Log?.Invoke($"已确认盒子AI绑定当前账号炉石 PID={hearthstoneProcessId}，其他炉石客户端继续独立运行。");
+        Log?.Invoke("已连接盒子AI：" + boxExecutable);
+        DateTimeOffset deadline = DateTimeOffset.UtcNow + _rendererDiscoveryTimeout;
+        DateTimeOffset firstCandidateAt = DateTimeOffset.MinValue;
+        bool capturedDuringWarmup = false;
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await Task.Run((Func<bool>)DiscoverRecommendationRenderers, cancellationToken))
+            {
+                firstCandidateAt = firstCandidateAt == DateTimeOffset.MinValue ? DateTimeOffset.UtcNow : firstCandidateAt;
+                int observations = await ScanKnownRenderersAsync(cancellationToken);
+                capturedDuringWarmup |= observations > 0;
+                if (DateTimeOffset.UtcNow - firstCandidateAt >= RendererWarmupWindow)
+                {
+                    Log?.Invoke(capturedDuringWarmup
+                        ? $"已定位盒子AI推荐模块，已完成开局读取预热，CEF 渲染进程 {_rendererProcessIds.Count} 个。"
+                        : $"已定位盒子AI推荐模块，CEF 渲染进程 {_rendererProcessIds.Count} 个；等待盒子产生当前对局建议。");
+                    return;
+                }
+            }
+
+            await Task.Delay(500, cancellationToken);
+        }
+        while (DateTimeOffset.UtcNow < deadline);
+        Log?.Invoke("盒子AI已启动；推荐模块尚未产生事件，进入对局后将继续自动定位。");
+    }
+
+    private async Task<int> ScanKnownRenderersAsync(CancellationToken cancellationToken)
+    {
+        int count = 0;
+        foreach (int processId in _rendererProcessIds.ToArray())
+        {
+            RendererScanResult scan = await Task.Run(() => ScanRenderer(processId, null, stopAfterCallback: false,
+                captureWinRate: Volatile.Read(in _winRateCaptureEnabled) != 0), cancellationToken);
+            LogRendererScanDiagnosticsIfChanged(processId, "开局预热", scan);
+            count += scan.Observations.Count;
+            CacheObservations(scan.Observations);
+            CacheWinRateObservations(scan.WinRateObservations);
+        }
+        return count;
+    }
+
+    public async Task<IReadOnlyList<NeteaseBoxRecommendationObservation>> ReadAsync(int desiredOptionId, CancellationToken cancellationToken)
+    {
+        return await ReadCoreAsync(desiredOptionId, forceFullScan: false, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<NeteaseBoxRecommendationObservation>> RefreshAsync(int desiredOptionId, CancellationToken cancellationToken)
+    {
+        return await ReadCoreAsync(desiredOptionId, forceFullScan: true, cancellationToken);
+    }
+
+    public async Task<bool> RelocateAsync(CancellationToken cancellationToken)
+    {
+        await _scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ValidateBindingBeforeRead();
+            // CEF pages can be replaced during loading. Discard locations, not
+            // first-seen timestamps/epochs: a rescan must not revive old moves.
+            InvalidateRendererLocations();
+            await Task.Run((Func<bool>)DiscoverRecommendationRenderers, cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    public async Task<bool> RestartAndReconnectAsync(int hearthstoneProcessId, string reason, CancellationToken cancellationToken)
+    {
+        await _scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!NeteaseBoxTargetBinding.CanRestartBoxWithoutClientRestart(NeteaseBoxTargetBinding.Inspect(hearthstoneProcessId)))
+            {
+                Log?.Invoke($"盒子AI取消盒子自动恢复：目标炉石 PID={hearthstoneProcessId} 既未保留盒子覆盖层、" + "也不是可安全首次绑定的最近启动客户端，保持当前绑定，不会改绑其他账号。");
+                return false;
+            }
+
+            Process[] running = Process.GetProcessesByName("HSAng");
+            try
+            {
+                Process[] array = running.Where((Process process) => !SafeHasExited(process)).ToArray();
+                if (array.Length > 1)
+                {
+                    Log?.Invoke($"盒子AI取消盒子自动恢复：检测到 {array.Length} 个 HSAng.exe。");
+                    return false;
+                }
+
+                string executablePath = ((array.Length == 1) ? (TryGetProcessPath(array[0]) ?? _boxExecutablePath) : _boxExecutablePath);
+                if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+                {
+                    executablePath = FindNeteaseBoxExecutable() ?? "";
+                }
+
+                if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+                {
+                    Log?.Invoke("盒子AI取消盒子自动恢复：无法确认 HSAng.exe 路径。");
+                    return false;
+                }
+
+                Log?.Invoke("盒子AI触发盒子自动恢复：" + reason);
+                await RestartBoxProcessAsync(array.FirstOrDefault(), executablePath, cancellationToken);
+                _boxExecutablePath = executablePath;
+                _boxRoot = Path.GetDirectoryName(executablePath) ?? "";
+                ResetScanState();
+                _initializedAt = DateTimeOffset.UtcNow;
+                await NeteaseBoxTargetBinding.WaitForTargetOverlayAsync(hearthstoneProcessId, "盒子AI策略", cancellationToken);
+                await ValidateCurrentHelperTargetAsync(executablePath, hearthstoneProcessId, cancellationToken);
+                Log?.Invoke($"盒子AI盒子已重启并重新绑定目标炉石 PID={hearthstoneProcessId}，等待当前对局推荐。");
+                return true;
+            }
+            finally
+            {
+                Process[] array2 = running;
+                for (int num = 0; num < array2.Length; num++)
+                {
+                    array2[num].Dispose();
+                }
+            }
+        }
+        catch (Exception ex)when (!(ex is OperationCanceledException))
+        {
+            Log?.Invoke("盒子AI盒子自动恢复失败：" + ex.Message);
+            return false;
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    public async Task<bool> StopForClientRestartAsync(int hearthstoneProcessId, string reason, CancellationToken cancellationToken)
+    {
+        await _scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!NeteaseBoxTargetBinding.CanRestartBoxWithoutClientRestart(NeteaseBoxTargetBinding.Inspect(hearthstoneProcessId)))
+            {
+                Log?.Invoke($"盒子AI取消盒子联动关闭：目标炉石 PID={hearthstoneProcessId} 未保留盒子覆盖层" + "且不是最近启动客户端，不会关闭可能属于其他账号的盒子。");
+                return false;
+            }
+
+            Process[] running = Process.GetProcessesByName("HSAng");
+            try
+            {
+                Process[] array = running.Where((Process process) => !SafeHasExited(process)).ToArray();
+                if (array.Length > 1)
+                {
+                    Log?.Invoke($"盒子AI取消盒子联动关闭：检测到 {array.Length} 个 HSAng.exe。");
+                    return false;
+                }
+
+                if (array.Length == 1)
+                {
+                    _boxExecutablePath = TryGetProcessPath(array[0]) ?? _boxExecutablePath;
+                    Log?.Invoke("盒子AI准备联动重启炉石和盒子：" + reason);
+                    await StopBoxProcessAsync(array[0], cancellationToken);
+                }
+
+                ResetScanState();
+                Log?.Invoke("盒子AI盒子已关闭；等待账号级恢复流程重启炉石后重新启动并绑定盒子。");
+                return true;
+            }
+            finally
+            {
+                Process[] array2 = running;
+                for (int num = 0; num < array2.Length; num++)
+                {
+                    array2[num].Dispose();
+                }
+            }
+        }
+        catch (Exception ex)when (!(ex is OperationCanceledException))
+        {
+            Log?.Invoke("盒子AI盒子联动关闭失败：" + ex.Message);
+            return false;
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<NeteaseBoxRecommendationObservation>> ReadCoreAsync(int desiredOptionId, bool forceFullScan, CancellationToken cancellationToken)
+    {
+        await _scanGate.WaitAsync(cancellationToken);
+        try
+        {
+            ValidateBindingBeforeRead();
+            RemoveExitedRenderers();
+            bool captureWinRate = Volatile.Read(in _winRateCaptureEnabled) != 0;
+            if (_rendererProcessIds.Count == 0 || (captureWinRate && _winRateRendererProcessIds.Count == 0))
+            {
+                await Task.Run((Func<bool>)DiscoverRecommendationRenderers, cancellationToken);
+            }
+
+            if (_rendererProcessIds.Count == 0)
+            {
+                return Array.Empty<NeteaseBoxRecommendationObservation>();
+            }
+
+            List<NeteaseBoxRecommendationObservation> observations = new List<NeteaseBoxRecommendationObservation>();
+            int[] array = _rendererProcessIds.ToArray();
+            foreach (int processId in array)
+            {
+                if (_payloadRegions.TryGetValue(processId, out HashSet<ulong> preferredRegions) && preferredRegions.Count != 0)
+                {
+                    RendererScanResult rendererScanResult = await Task.Run(() => ScanRenderer(processId, preferredRegions, stopAfterCallback: false, captureWinRate), cancellationToken);
+                    LogRendererScanDiagnosticsIfChanged(processId, "缓存区域", rendererScanResult);
+                    observations.AddRange(rendererScanResult.Observations);
+                    CacheWinRateObservations(rendererScanResult.WinRateObservations);
+                }
+            }
+
+            if (captureWinRate)
+            {
+                await RefreshWinRateMemoryAsync(cancellationToken);
+            }
+
+            CacheObservations(observations);
+            IReadOnlyList<NeteaseBoxRecommendationObservation> readOnlyList = CurrentMatches(desiredOptionId);
+            if (readOnlyList.Count > 0 && !forceFullScan && desiredOptionId > 0)
+            {
+                return readOnlyList;
+            }
+
+            if (DateTimeOffset.UtcNow - _lastRendererDiscoveryAt >= TimeSpan.FromSeconds(1.0))
+            {
+                _lastRendererDiscoveryAt = DateTimeOffset.UtcNow;
+                await Task.Run((Func<bool>)DiscoverRecommendationRenderers, cancellationToken);
+            }
+
+            if (forceFullScan || DateTimeOffset.UtcNow - _lastFullScanAt >= TimeSpan.FromMilliseconds(400.0))
+            {
+                _lastFullScanAt = DateTimeOffset.UtcNow;
+                observations.Clear();
+                array = _rendererProcessIds.ToArray();
+                foreach (int processId2 in array)
+                {
+                    RendererScanResult rendererScanResult2 = await Task.Run(() => ScanRenderer(processId2, null, stopAfterCallback: false, captureWinRate), cancellationToken);
+                    LogRendererScanDiagnosticsIfChanged(processId2, "完整扫描", rendererScanResult2);
+                    observations.AddRange(rendererScanResult2.Observations);
+                    CacheWinRateObservations(rendererScanResult2.WinRateObservations);
+                }
+
+                CacheObservations(observations);
+            }
+
+            return CurrentMatches(desiredOptionId);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    private IReadOnlyList<NeteaseBoxRecommendationObservation> CurrentMatches(int desiredOptionId)
+    {
+        DateTimeOffset oldestAccepted = DateTimeOffset.UtcNow.AddSeconds(-20.0);
+        if (desiredOptionId > 0 && _latestByOptionId.TryGetValue(desiredOptionId, out List<NeteaseBoxRecommendationObservation> value))
+        {
+            return (
+                from item in value
+                where item.CapturedAt != DateTimeOffset.MinValue && item.CapturedAt >= _initializedAt.AddSeconds(-2.0) && item.CapturedAt >= _recommendationEpoch
+                orderby item.CapturedAt descending
+                select item).ToArray();
+        }
+
+        if (desiredOptionId > 0)
+        {
+            return Array.Empty<NeteaseBoxRecommendationObservation>();
+        }
+
+        return (
+            from item in _latestByOptionId.Values.SelectMany((List<NeteaseBoxRecommendationObservation> items) => items)
+            where item.CapturedAt != DateTimeOffset.MinValue && item.CapturedAt >= _initializedAt.AddSeconds(-2.0) && item.CapturedAt >= _recommendationEpoch && item.CapturedAt >= oldestAccepted
+            orderby item.CapturedAt descending
+            select item).Take(24).ToArray();
+    }
+
+    private void CacheObservations(IEnumerable<NeteaseBoxRecommendationObservation> observations)
+    {
+        foreach (NeteaseBoxRecommendationObservation observation2 in observations)
+        {
+            NeteaseBoxRecommendationObservation observation = NormalizeMemoryObservation(observation2);
+            if (!_latestByOptionId.TryGetValue(observation.Payload.OptionId, out List<NeteaseBoxRecommendationObservation> value))
+            {
+                value = new List<NeteaseBoxRecommendationObservation>();
+                _latestByOptionId[observation.Payload.OptionId] = value;
+            }
+
+            if (!value.Any((NeteaseBoxRecommendationObservation item) => item.RendererProcessId == observation.RendererProcessId && item.Address == observation.Address && item.CapturedAt == observation.CapturedAt))
+            {
+                value.Add(observation);
+                value.Sort((NeteaseBoxRecommendationObservation left, NeteaseBoxRecommendationObservation right) => right.CapturedAt.CompareTo(left.CapturedAt));
+                if (value.Count > 12)
+                {
+                    value.RemoveRange(12, value.Count - 12);
+                }
+            }
+        }
+    }
+
+    private async Task RefreshWinRateMemoryAsync(CancellationToken cancellationToken)
+    {
+        int[] array;
+        if (DateTimeOffset.UtcNow - _lastWinRateScanAt >= TimeSpan.FromSeconds(1.0))
+        {
+            _lastWinRateScanAt = DateTimeOffset.UtcNow;
+            array = _winRateRendererProcessIds.ToArray();
+            foreach (int processId in array)
+            {
+                if (_winRateRegions.TryGetValue(processId, out HashSet<ulong> preferredRegions) && preferredRegions.Count != 0)
+                {
+                    CacheWinRateObservations((await Task.Run(() => ScanRenderer(processId, preferredRegions, stopAfterCallback: false, captureWinRate: true), cancellationToken)).WinRateObservations);
+                }
+            }
+        }
+
+        if (DateTimeOffset.UtcNow - _lastWinRateRelocationScanAt < TimeSpan.FromSeconds(30.0))
+        {
+            return;
+        }
+
+        _lastWinRateRelocationScanAt = DateTimeOffset.UtcNow;
+        array = _winRateRendererProcessIds.ToArray();
+        foreach (int processId2 in array)
+        {
+            CacheWinRateObservations((await Task.Run(() => ScanRenderer(processId2, null, stopAfterCallback: false, captureWinRate: true), cancellationToken)).WinRateObservations);
+        }
+    }
+
+    private void CacheWinRateObservations(IEnumerable<NeteaseBoxWinRateObservation> observations)
+    {
+        foreach (NeteaseBoxWinRateObservation observation2 in observations)
+        {
+            bool flag = !double.IsFinite(observation2.Payload.MyWinRate);
+            if (!flag)
+            {
+                double myWinRate = observation2.Payload.MyWinRate;
+                bool flag2 = ((myWinRate < 0.0 || myWinRate > 100.0) ? true : false);
+                flag = flag2;
+            }
+
+            if (flag)
+            {
+                continue;
+            }
+
+            IFormatProvider invariantCulture = CultureInfo.InvariantCulture;
+            DefaultInterpolatedStringHandler handler = new DefaultInterpolatedStringHandler(13, 6, invariantCulture);
+            handler.AppendLiteral("winrate|");
+            handler.AppendFormatted(observation2.RendererProcessId);
+            handler.AppendLiteral("|");
+            handler.AppendFormatted(observation2.Address, "X");
+            handler.AppendLiteral("|");
+            handler.AppendFormatted(observation2.Payload.MyWinRate, "R");
+            handler.AppendLiteral("|");
+            handler.AppendFormatted(observation2.Payload.Turns.LastOrDefault()?.TurnId ?? 0);
+            handler.AppendLiteral("|");
+            handler.AppendFormatted(observation2.Payload.MyPlayer?.Name);
+            handler.AppendLiteral("|");
+            handler.AppendFormatted(observation2.Payload.OpponentPlayer?.Name);
+            string key = string.Create(invariantCulture, ref handler);
+            if (!_memoryObservationFirstSeen.TryGetValue(key, out var value))
+            {
+                value = DateTimeOffset.UtcNow;
+                _memoryObservationFirstSeen[key] = value;
+                if (_enableDiagnostics)
+                {
+                    NeteaseBoxWinRateTurn neteaseBoxWinRateTurn = observation2.Payload.Turns.LastOrDefault();
+                    Log?.Invoke($"盒子AI胜率候选：PID={observation2.RendererProcessId}，地址=0x{observation2.Address:X}，回合={neteaseBoxWinRateTurn?.TurnId ?? 0}，胜率={observation2.Payload.MyWinRate:0.####}%，时间={neteaseBoxWinRateTurn?.Timestamp ?? ""}，历史点={observation2.Payload.Turns.Count}。");
+                }
+            }
+
+            NeteaseBoxWinRateObservation observation = ((observation2.CapturedAt == DateTimeOffset.MinValue) ? observation2 with
+            {
+                CapturedAt = value
+            }
+
+            : observation2);
+            if (!_latestWinRates.Any((NeteaseBoxWinRateObservation item) => item.RendererProcessId == observation.RendererProcessId && item.Address == observation.Address && item.CapturedAt == observation.CapturedAt && Math.Abs(item.Payload.MyWinRate - observation.Payload.MyWinRate) < 1E-06))
+            {
+                _latestWinRates.Add(observation);
+            }
+        }
+
+        _latestWinRates.Sort((NeteaseBoxWinRateObservation left, NeteaseBoxWinRateObservation right) =>
+        {
+            int num = right.CapturedAt.CompareTo(left.CapturedAt);
+            if (num != 0)
+            {
+                return num;
+            }
+
+            int num2 = right.Payload.Turns.LastOrDefault()?.TurnId ?? 0;
+            int value2 = left.Payload.Turns.LastOrDefault()?.TurnId ?? 0;
+            return num2.CompareTo(value2);
+        });
+        if (_latestWinRates.Count > 32)
+        {
+            _latestWinRates.RemoveRange(32, _latestWinRates.Count - 32);
+        }
+    }
+
+    private NeteaseBoxRecommendationObservation NormalizeMemoryObservation(NeteaseBoxRecommendationObservation observation)
+    {
+        if (observation.CapturedAt != DateTimeOffset.MinValue)
+        {
+            return observation;
+        }
+
+        string key = BuildMemoryObservationIdentity(observation);
+        if (!_memoryObservationFirstSeen.TryGetValue(key, out var value))
+        {
+            value = DateTimeOffset.UtcNow;
+            _memoryObservationFirstSeen[key] = value;
+        }
+
+        return observation with
+        {
+            CapturedAt = value
+        };
+    }
+
+    private static string BuildMemoryObservationIdentity(NeteaseBoxRecommendationObservation observation)
+    {
+        NeteaseBoxRecommendation payload = observation.Payload;
+        string value = string.Join(";", payload.Data.Select((NeteaseBoxRecommendedAction action) => string.Join("|", action.ActionName, SafeRawText(action.Card), SafeRawText(action.Target), SafeRawText(action.OppTarget), SafeRawText(action.TargetHero), SafeRawText(action.OppTargetHero), SafeRawText(action.HyphenTarget), SafeRawText(action.HyphenOppTarget), SafeRawText(action.HyphenTargetHero), SafeRawText(action.HyphenOppTargetHero), SafeRawText(action.SubOption), string.Join(",", from pair in action.ExtensionData.OrderBy((KeyValuePair<string, JsonElement> pair) => pair.Key, StringComparer.Ordinal)select pair.Key + "=" + SafeRawText(pair.Value)), action.Position.ToString(CultureInfo.InvariantCulture), action.UsingDisguised.ToString(CultureInfo.InvariantCulture))));
+        IFormatProvider invariantCulture = CultureInfo.InvariantCulture;
+        DefaultInterpolatedStringHandler handler = new DefaultInterpolatedStringHandler(6, 7, invariantCulture);
+        handler.AppendFormatted(observation.RendererProcessId);
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(observation.Address, "X");
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(payload.ChoiceId);
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(payload.OptionId);
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(payload.TurnNum);
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(payload.Status);
+        handler.AppendLiteral("|");
+        handler.AppendFormatted(value);
+        return string.Create(invariantCulture, ref handler);
+    }
+
+    private static string SafeRawText(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Undefined)
+        {
+            return element.GetRawText();
+        }
+
+        return "";
+    }
+
+    private bool DiscoverRecommendationRenderers()
+    {
+        bool result = false;
+        DateTimeOffset utcNow = DateTimeOffset.UtcNow;
+        bool flag = Volatile.Read(in _winRateCaptureEnabled) != 0;
+        Process[] processesByName = Process.GetProcessesByName("browser");
+        foreach (Process process in processesByName)
+        {
+            using (process)
+            {
+                string path = TryGetProcessPath(process);
+                bool flag2 = IsNeteaseBoxProcessPath(path);
+                LogRendererCandidateOnce(process, path, flag2);
+                if (!flag2)
+                {
+                    continue;
+                }
+
+                if (_rendererProcessIds.Contains(process.Id))
+                {
+                    result = true;
+                }
+                else
+                {
+                    if (flag && _winRateRendererProcessIds.Contains(process.Id))
+                    {
+                        continue;
+                    }
+
+                    TimeSpan timeSpan = (_winRateCallbackCandidates.Contains(process.Id) ? TimeSpan.FromSeconds(30.0) : TimeSpan.FromSeconds(3.0));
+                    if (_rendererCandidateScans.TryGetValue(process.Id, out var value) && utcNow - value < timeSpan)
+                    {
+                        continue;
+                    }
+
+                    _rendererCandidateScans[process.Id] = utcNow;
+                    RendererScanResult rendererScanResult = ScanRenderer(process.Id, null, stopAfterCallback: true, flag);
+                    LogRendererScanDiagnosticsIfChanged(process.Id, "候选定位", rendererScanResult);
+                    if (!rendererScanResult.HasRecommendationCallback && !rendererScanResult.HasWinRateCallback)
+                    {
+                        continue;
+                    }
+
+                    if (rendererScanResult.HasRecommendationCallback)
+                    {
+                        _rendererProcessIds.Add(process.Id);
+                        result = true;
+                    }
+
+                    if (flag && rendererScanResult.HasWinRateCallback)
+                    {
+                        _winRateCallbackCandidates.Add(process.Id);
+                        if (rendererScanResult.WinRateObservations.Count > 0)
+                        {
+                            _winRateRendererProcessIds.Add(process.Id);
+                            CacheWinRateObservations(rendererScanResult.WinRateObservations);
+                            _lastWinRateRelocationScanAt = DateTimeOffset.MinValue;
+                            Log?.Invoke($"已定位盒子AI胜率预测模块，CEF 渲染进程 PID={process.Id}。");
+                        }
+                    }
+
+                    CacheObservations(rendererScanResult.Observations);
+                    continue;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private RendererScanResult ScanRenderer(int processId, IReadOnlyCollection<ulong>? preferredRegions, bool stopAfterCallback, bool captureWinRate)
+    {
+        nint num = OpenProcess(1040u, inheritHandle: false, processId);
+        if (num == IntPtr.Zero)
+        {
+            return RendererScanResult.OpenProcessFailure(Marshal.GetLastWin32Error());
+        }
+
+        try
+        {
+            List<NeteaseBoxRecommendationObservation> list = new List<NeteaseBoxRecommendationObservation>();
+            List<NeteaseBoxWinRateObservation> list2 = new List<NeteaseBoxWinRateObservation>();
+            bool flag = false;
+            bool flag2 = false;
+            int num2 = 0;
+            int num3 = 0;
+            int num4 = 0;
+            int num5 = 0;
+            int num6 = 0;
+            HashSet<int> hashSet = new HashSet<int>();
+            if (preferredRegions != null && preferredRegions.Count > 0)
+            {
+                foreach (ulong preferredRegion in preferredRegions)
+                {
+                    num2++;
+                    num3++;
+                    if (!TryReadRegion(num, preferredRegion, out ulong actualBaseAddress, out byte[] bytes, out int win32Error))
+                    {
+                        num5++;
+                        if (win32Error != 0)
+                        {
+                            hashSet.Add(win32Error);
+                        }
+
+                        continue;
+                    }
+
+                    num4++;
+                    bool flag3 = ContainsRecommendationCallback(bytes);
+                    bool flag4 = captureWinRate && ContainsWinRateCallback(bytes);
+                    if (flag3 | flag4)
+                    {
+                        num6++;
+                    }
+
+                    flag |= flag3;
+                    flag2 |= flag4;
+                    list.AddRange(NeteaseBoxMemoryPayloadExtractor.Extract(bytes, processId, actualBaseAddress));
+                    if (captureWinRate)
+                    {
+                        list2.AddRange(NeteaseBoxMemoryPayloadExtractor.ExtractWinRates(bytes, processId, actualBaseAddress));
+                    }
+                }
+
+                return new RendererScanResult(flag, flag2, list, list2, new RendererScanDiagnostics(OpenProcessSucceeded: true, 0, num2, num3, num4, num5, hashSet.Order().ToArray(), num6));
+            }
+
+            ulong num7 = 0uL;
+            MemoryBasicInformation buffer;
+            while (VirtualQueryEx(num, new IntPtr((long)num7), out buffer, (nuint)Marshal.SizeOf<MemoryBasicInformation>()) != 0)
+            {
+                num2++;
+                ulong num8 = (ulong)((IntPtr)buffer.BaseAddress).ToInt64();
+                ulong num9 = ((UIntPtr)buffer.RegionSize).ToUInt64();
+                if (IsReadablePrivateRegion(buffer, num9))
+                {
+                    num3++;
+                    if (TryReadRegion(num, num8, out ulong _, out byte[] bytes2, out int win32Error2))
+                    {
+                        num4++;
+                        bool flag5 = ContainsRecommendationCallback(bytes2);
+                        bool flag6 = captureWinRate && ContainsWinRateCallback(bytes2);
+                        if (flag5 | flag6)
+                        {
+                            num6++;
+                        }
+
+                        flag |= flag5;
+                        flag2 |= flag6;
+                        IReadOnlyList<NeteaseBoxRecommendationObservation> readOnlyList = NeteaseBoxMemoryPayloadExtractor.Extract(bytes2, processId, num8);
+                        if (readOnlyList.Count > 0)
+                        {
+                            list.AddRange(readOnlyList);
+                            if (!_payloadRegions.TryGetValue(processId, out HashSet<ulong> value))
+                            {
+                                value = new HashSet<ulong>();
+                                _payloadRegions[processId] = value;
+                            }
+
+                            value.Add(num8);
+                        }
+
+                        bool flag7 = false;
+                        if (captureWinRate)
+                        {
+                            IReadOnlyList<NeteaseBoxWinRateObservation> readOnlyList2 = NeteaseBoxMemoryPayloadExtractor.ExtractWinRates(bytes2, processId, num8);
+                            flag7 = readOnlyList2.Count > 0;
+                            if (readOnlyList2.Count > 0)
+                            {
+                                list2.AddRange(readOnlyList2);
+                                if (!_winRateRegions.TryGetValue(processId, out HashSet<ulong> value2))
+                                {
+                                    value2 = new HashSet<ulong>();
+                                    _winRateRegions[processId] = value2;
+                                }
+
+                                value2.Add(num8);
+                            }
+                        }
+
+                        if (stopAfterCallback && (flag5 | flag7))
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        num5++;
+                        if (win32Error2 != 0)
+                        {
+                            hashSet.Add(win32Error2);
+                        }
+                    }
+                }
+
+                ulong num10 = num8 + num9;
+                if (num10 <= num7)
+                {
+                    break;
+                }
+
+                num7 = num10;
+            }
+
+            return new RendererScanResult(flag, flag2, list, list2, new RendererScanDiagnostics(OpenProcessSucceeded: true, 0, num2, num3, num4, num5, hashSet.Order().ToArray(), num6));
+        }
+        finally
+        {
+            CloseHandle(num);
+        }
+    }
+
+    private static bool TryReadRegion(nint processHandle, ulong requestedAddress, out ulong actualBaseAddress, out byte[] bytes, out int win32Error)
+    {
+        actualBaseAddress = 0uL;
+        bytes = Array.Empty<byte>();
+        win32Error = 0;
+        if (VirtualQueryEx(processHandle, new IntPtr((long)requestedAddress), out var buffer, (nuint)Marshal.SizeOf<MemoryBasicInformation>()) == 0)
+        {
+            win32Error = Marshal.GetLastWin32Error();
+            return false;
+        }
+
+        actualBaseAddress = (ulong)((IntPtr)buffer.BaseAddress).ToInt64();
+        ulong num = ((UIntPtr)buffer.RegionSize).ToUInt64();
+        if (!IsReadablePrivateRegion(buffer, num))
+        {
+            return false;
+        }
+
+        bytes = new byte[(uint)num];
+        if (!ReadProcessMemory(processHandle, buffer.BaseAddress, bytes, (nuint)bytes.Length, out var bytesRead) || bytesRead == 0)
+        {
+            win32Error = Marshal.GetLastWin32Error();
+            bytes = Array.Empty<byte>();
+            return false;
+        }
+
+        if (bytesRead < (nuint)bytes.Length)
+        {
+            Array.Resize(ref bytes, checked((int)bytesRead));
+        }
+
+        return true;
+    }
+
+    private static bool IsReadablePrivateRegion(MemoryBasicInformation memory, ulong regionSize)
+    {
+        if (memory.State != 4096 || memory.Type != 131072 || regionSize == 0L || regionSize > 67108864 || (memory.Protect & 0x100) != 0)
+        {
+            return false;
+        }
+
+        switch (memory.Protect & 0xFF)
+        {
+            case 2u:
+            case 4u:
+            case 8u:
+            case 32u:
+            case 64u:
+            case 128u:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool ContainsRecommendationCallback(byte[] bytes)
+    {
+        if (bytes.AsSpan().IndexOf(CallbackMarker) < 0)
+        {
+            return bytes.AsSpan().IndexOf(CallbackMarkerUtf16) >= 0;
+        }
+
+        return true;
+    }
+
+    private static bool ContainsWinRateCallback(byte[] bytes)
+    {
+        if (bytes.AsSpan().IndexOf(WinRateCallbackMarker) < 0)
+        {
+            return bytes.AsSpan().IndexOf(WinRateCallbackMarkerUtf16) >= 0;
+        }
+
+        return true;
+    }
+
+    private void LogRendererCandidateOnce(Process process, string? path, bool directoryMatchesBox)
+    {
+        if (_enableDiagnostics && _reportedRendererCandidates.Add(process.Id))
+        {
+            ProcessIntegrityInfo processIntegrityInfo = ReadProcessIntegrity(process.Id);
+            Log?.Invoke($"盒子AI CEF 候选：PID={process.Id}，路径={DisplayPath(path)}，CEF 版本={DescribeCefVersion(path)}，权限={processIntegrityInfo.DisplayText}，盒子目录匹配={(directoryMatchesBox ? "是" : "否")}。");
+        }
+    }
+
+    private void LogRendererScanDiagnosticsIfChanged(int processId, string scope, RendererScanResult scan)
+    {
+        if (_enableDiagnostics)
+        {
+            RendererScanDiagnostics diagnostics = scan.Diagnostics;
+            string text = ((diagnostics.ReadErrorCodes.Count == 0) ? "无" : string.Join(",", diagnostics.ReadErrorCodes));
+            string text2 = string.Join("|", diagnostics.OpenProcessSucceeded, diagnostics.OpenProcessError, diagnostics.ReadFailureCount > 0, text, diagnostics.CallbackRegionCount > 0, scan.Observations.Count > 0);
+            (int, string) key = (processId, scope);
+            if (!_rendererDiagnosticSignatures.TryGetValue(key, out string value) || !string.Equals(value, text2, StringComparison.Ordinal))
+            {
+                _rendererDiagnosticSignatures[key] = text2;
+                string value2 = (diagnostics.OpenProcessSucceeded ? "成功" : $"失败(Win32={diagnostics.OpenProcessError})");
+                Log?.Invoke($"盒子AI CEF 扫描[{scope}]：PID={processId}，OpenProcess={value2}，扫描区域={diagnostics.QueriedRegionCount}，可读候选区域={diagnostics.EligibleRegionCount}，ReadProcessMemory 成功={diagnostics.ReadSuccessCount}、失败={diagnostics.ReadFailureCount}，Win32 错误码={text}，callback 区域={diagnostics.CallbackRegionCount}，payload 数={scan.Observations.Count}。");
+            }
+        }
+    }
+
+    private void RemoveRendererDiagnosticSignatures(int processId)
+    {
+        (int, string)[] array = _rendererDiagnosticSignatures.Keys.Where(((int ProcessId, string Scope) tuple) => tuple.ProcessId == processId).ToArray();
+        foreach ((int, string) key in array)
+        {
+            _rendererDiagnosticSignatures.Remove(key);
+        }
+    }
+
+    private void RemoveExitedRenderers()
+    {
+        int[] array = _rendererProcessIds.Concat(_winRateRendererProcessIds).Distinct().ToArray();
+        foreach (int num in array)
+        {
+            try
+            {
+                using Process process = Process.GetProcessById(num);
+                if (!process.HasExited)
+                {
+                    continue;
+                }
+            }
+            catch
+            {
+            }
+
+            _rendererProcessIds.Remove(num);
+            _winRateRendererProcessIds.Remove(num);
+            _winRateCallbackCandidates.Remove(num);
+            _rendererCandidateScans.Remove(num);
+            _winRateCallbackCandidates.Remove(num);
+            _payloadRegions.Remove(num);
+            _winRateRegions.Remove(num);
+            _reportedRendererCandidates.Remove(num);
+            RemoveRendererDiagnosticSignatures(num);
+        }
+
+        array = _rendererCandidateScans.Keys.ToArray();
+        foreach (int num2 in array)
+        {
+            try
+            {
+                using Process process2 = Process.GetProcessById(num2);
+                if (!process2.HasExited)
+                {
+                    continue;
+                }
+            }
+            catch
+            {
+            }
+
+            _rendererCandidateScans.Remove(num2);
+            _reportedRendererCandidates.Remove(num2);
+            RemoveRendererDiagnosticSignatures(num2);
+        }
+    }
+
+    private bool IsNeteaseBoxProcessPath(string? path)
+    {
+        if (!string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(_boxRoot))
+        {
+            return string.Equals(Path.GetDirectoryName(path), _boxRoot, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return false;
+    }
+
+    private void InvalidateRendererLocations()
+    {
+        _rendererProcessIds.Clear();
+        _winRateRendererProcessIds.Clear();
+        _winRateCallbackCandidates.Clear();
+        _rendererCandidateScans.Clear();
+        _payloadRegions.Clear();
+        _winRateRegions.Clear();
+        _reportedRendererCandidates.Clear();
+        _rendererDiagnosticSignatures.Clear();
+        _lastRendererDiscoveryAt = DateTimeOffset.MinValue;
+        _lastFullScanAt = DateTimeOffset.MinValue;
+        _lastWinRateScanAt = DateTimeOffset.MinValue;
+        _lastWinRateRelocationScanAt = DateTimeOffset.MinValue;
+    }
+
+    private void ResetScanState()
+    {
+        InvalidateRendererLocations();
+        _latestByOptionId.Clear();
+        _latestWinRates.Clear();
+        _memoryObservationFirstSeen.Clear();
+    }
+
+    private static bool SafeHasExited(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    private async Task<string> EnsureSingleNeteaseBoxProcessAsync(int targetProcessId, CancellationToken cancellationToken)
+    {
+        var clock = Stopwatch.StartNew();
+        string reason = "尚未检测到炉石盒子进程。";
+        bool reported = false;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var all = new ProcessCollection(Process.GetProcessesByName("HSAng"));
+            var alive = all.Processes.Where(p => !SafeHasExited(p)).ToArray();
+            if (alive.Length > 1)
+                throw new InvalidOperationException("检测到多个炉石盒子进程；请保留一个盒子后重试，不会自动关闭任何进程。");
+            if (alive.Length == 1)
+            {
+                var path = TryGetProcessPath(alive[0]);
+                if (!string.IsNullOrWhiteSpace(path)) return path;
+                reason = "无法读取盒子路径，请保持盒子与本软件权限一致。";
+            }
+            if (clock.Elapsed >= BindingConfirmationTimeout)
+                throw new TimeoutException("等待炉石盒子进程就绪超时。" + reason + "请正常启动盒子后重试；没有注销账号或重启进程。");
+            if (!reported) { Log?.Invoke("等待炉石盒子进程就绪（最多 8 秒，可随时停止）。"); reported = true; }
+            await Task.Delay(250, cancellationToken);
+        }
+    }
+
+    private async Task ValidateCurrentHelperTargetAsync(string boxExecutablePath, int targetProcessId, CancellationToken cancellationToken)
+    {
+        var assessment = await NeteaseBoxBindingEvidence.WaitForVerificationAsync(
+            () => ObserveCurrentBinding(boxExecutablePath, targetProcessId), BindingConfirmationTimeout, cancellationToken,
+            reason => Log?.Invoke($"等待盒子确认当前炉石连接（最多 {BindingConfirmationTimeout.TotalSeconds:0} 秒，可随时停止）：{reason}"));
+        RememberBinding(assessment);
+        _boundHearthstoneProcessId = targetProcessId;
+        if (assessment.Reused) Log?.Invoke("已复用当前盒子与炉石进程的已核实连接，不需要重新登录账号。");
+    }
+
+    private NeteaseBoxBindingAssessment ObserveCurrentBinding(string boxExecutablePath, int targetProcessId)
+    {
+        using ProcessCollection processes = new ProcessCollection(Process.GetProcessesByName("HSAng"));
+        var alive = processes.Processes.Where(candidate => !SafeHasExited(candidate)).ToArray();
+        if (alive.Length > 1)
+        {
+            lock (VerifiedBindingGate) _lastVerifiedBinding = null;
+            return new(NeteaseBoxBindingVerdict.Conflict, "检测到多个盒子进程，无法确认推荐属于哪个客户端；请保留一个盒子后重试。");
+        }
+        NeteaseBoxProcessSession box = null;
+        if (alive.Length == 1)
+        {
+            try
+            {
+                var path = TryGetProcessPath(alive[0]);
+                if (!string.IsNullOrWhiteSpace(path) && string.Equals(path, boxExecutablePath, StringComparison.OrdinalIgnoreCase))
+                    box = new(alive[0].Id, alive[0].StartTime.ToUniversalTime().Ticks, path);
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or UnauthorizedAccessException) { }
+        }
+        var clients = NeteaseBoxTargetBinding.SnapshotLiveClients();
+        var helper = NeteaseBoxTargetBinding.ReadLatestHelperTarget(Path.Combine(Path.GetDirectoryName(boxExecutablePath) ?? "", "heart_helper.log"));
+        NeteaseBoxVerifiedSession verified;
+        lock (VerifiedBindingGate) verified = _lastVerifiedBinding;
+        var assessment = NeteaseBoxBindingEvidence.Assess(targetProcessId, box, clients, helper, verified, DateTimeOffset.UtcNow);
+        // Once new/conflicting/unreadable evidence invalidates a proof, a later missing log cannot revive it.
+        if (assessment.Verdict != NeteaseBoxBindingVerdict.Verified)
+        {
+            lock (VerifiedBindingGate)
+                if (ReferenceEquals(_lastVerifiedBinding, verified)) _lastVerifiedBinding = null;
+        }
+        return assessment;
+    }
+
+    private static void RememberBinding(NeteaseBoxBindingAssessment assessment)
+    {
+        if (assessment.Verdict != NeteaseBoxBindingVerdict.Verified || assessment.Session == null)
+            throw new InvalidOperationException("连接证据尚未核实，不能读取推荐。");
+        lock (VerifiedBindingGate) _lastVerifiedBinding = assessment.Session;
+    }
+
+    private void ValidateBindingBeforeRead()
+    {
+        if (_boundHearthstoneProcessId <= 0 || string.IsNullOrWhiteSpace(_boxExecutablePath))
+            throw new InvalidOperationException("盒子连接尚未完成初始化，不能读取推荐。");
+        var assessment = ObserveCurrentBinding(_boxExecutablePath, _boundHearthstoneProcessId);
+        if (assessment.Verdict != NeteaseBoxBindingVerdict.Verified)
+            throw new InvalidOperationException("盒子连接证据已变化，停止推荐读取以保持账号隔离。" + assessment.Reason);
+        RememberBinding(assessment);
+    }
+
+    private static async Task RestartBoxProcessAsync(Process? current, string executablePath, CancellationToken cancellationToken)
+    {
+        await StopBoxProcessAsync(current, cancellationToken);
+        Process.Start(CreateBoxProcessStartInfo(executablePath));
+        DateTimeOffset deadline = DateTimeOffset.UtcNow.AddSeconds(20.0);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Delay(250, cancellationToken);
+            Process[] processesByName = Process.GetProcessesByName("HSAng");
+            try
+            {
+                Process[] array = processesByName.Where((Process process) => !SafeHasExited(process)).ToArray();
+                if (array.Length == 1)
+                {
+                    return;
+                }
+
+                if (array.Length > 1)
+                {
+                    throw new InvalidOperationException("重新连接盒子AI后检测到多个盒子进程，已停止初始化。");
+                }
+            }
+            finally
+            {
+                Process[] array2 = processesByName;
+                for (int num = 0; num < array2.Length; num++)
+                {
+                    array2[num].Dispose();
+                }
+            }
+        }
+
+        throw new TimeoutException("重新连接盒子AI后 20 秒内未检测到 HSAng.exe。");
+    }
+
+    private static Task StopBoxProcessAsync(Process current, CancellationToken cancellationToken)
+    {
+        throw new InvalidOperationException("开源初版不自动关闭盒子，请手动重新打开后重试。");
+    }
+
+    private static ProcessStartInfo CreateBoxProcessStartInfo(string executablePath)
+    {
+        ProcessStartInfo processStartInfo = new ProcessStartInfo();
+        processStartInfo.FileName = executablePath;
+        processStartInfo.WorkingDirectory = Path.GetDirectoryName(executablePath) ?? "";
+        processStartInfo.UseShellExecute = false;
+        processStartInfo.Environment["HTTP_PROXY"] = "";
+        processStartInfo.Environment["HTTPS_PROXY"] = "";
+        processStartInfo.Environment["ALL_PROXY"] = "";
+        processStartInfo.Environment["NO_PROXY"] = "*";
+        return processStartInfo;
+    }
+
+    public static async Task StopAllBoxProcessesAsync(CancellationToken cancellationToken)
+    {
+        Process[] running = Process.GetProcessesByName("HSAng");
+        try
+        {
+            foreach (Process item in running.Where((Process process) => !SafeHasExited(process)))
+            {
+                await StopBoxProcessAsync(item, cancellationToken);
+            }
+        }
+        finally
+        {
+            Process[] array = running;
+            for (int num = 0; num < array.Length; num++)
+            {
+                array[num].Dispose();
+            }
+        }
+    }
+
+    private string LogBoxDiagnosticsAndValidatePermissions(Process boxProcess, string executablePath)
+    {
+        ProcessIntegrityInfo processIntegrityInfo = ReadProcessIntegrity(Environment.ProcessId);
+        ProcessIntegrityInfo processIntegrityInfo2 = ReadProcessIntegrity(boxProcess.Id);
+        if (_enableDiagnostics)
+        {
+            Log?.Invoke($"盒子AI诊断：HsAuto PID={Environment.ProcessId}、权限={processIntegrityInfo.DisplayText}；HSAng PID={boxProcess.Id}、路径={DisplayPath(executablePath)}、盒子版本={DescribeExecutableVersion(executablePath)}、CEF 版本={DescribeCefVersion(executablePath)}、权限={processIntegrityInfo2.DisplayText}。");
+        }
+
+        if (processIntegrityInfo.IsKnown && processIntegrityInfo2.IsKnown && processIntegrityInfo.Band != processIntegrityInfo2.Band)
+        {
+            string text = $"HsAuto 与“盒子AI”所连接的盒子权限等级不一致（HsAuto={processIntegrityInfo.Label}，盒子={processIntegrityInfo2.Label}）。" + "请使用相同权限启动 HsAuto 和炉石传说盒子后重试；若盒子为管理员权限，请以管理员身份运行 HsAuto。";
+            Log?.Invoke(text);
+            throw new InvalidOperationException(text);
+        }
+
+        return executablePath;
+    }
+
+    private static string DisplayPath(string? path)
+    {
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            return path;
+        }
+
+        return "<无法读取>";
+    }
+
+    private static string DescribeExecutableVersion(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return "未知";
+        }
+
+        try
+        {
+            FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(path);
+            string text = versionInfo.FileVersion?.Trim();
+            string text2 = versionInfo.ProductVersion?.Trim();
+            if (!string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(text2) && !string.Equals(text, text2, StringComparison.OrdinalIgnoreCase))
+            {
+                return "文件 " + text + " / 产品 " + text2;
+            }
+
+            string result;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                result = ((!string.IsNullOrWhiteSpace(text2)) ? text2 : "未知");
+            }
+            else
+            {
+                result = text;
+            }
+
+            return result;
+        }
+        catch
+        {
+            return "读取失败";
+        }
+    }
+
+    private static string DescribeCefVersion(string? processPath)
+    {
+        if (!string.IsNullOrWhiteSpace(processPath))
+        {
+            string directoryName = Path.GetDirectoryName(processPath);
+            if (!string.IsNullOrWhiteSpace(directoryName))
+            {
+                string text = DescribeExecutableVersion(Path.Combine(directoryName, "libcef.dll"));
+                if (!string.Equals(text, "未知", StringComparison.Ordinal) && !string.Equals(text, "读取失败", StringComparison.Ordinal))
+                {
+                    return text;
+                }
+            }
+        }
+
+        return DescribeExecutableVersion(processPath);
+    }
+
+    private static ProcessIntegrityInfo ReadProcessIntegrity(int processId)
+    {
+        nint num = OpenProcess(4096u, inheritHandle: false, processId);
+        if (num == IntPtr.Zero)
+        {
+            return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+        }
+
+        try
+        {
+            if (!OpenProcessToken(num, 8u, out var tokenHandle))
+            {
+                return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+            }
+
+            try
+            {
+                GetTokenInformation(tokenHandle, 25, IntPtr.Zero, 0, out var returnLength);
+                if (returnLength <= 0)
+                {
+                    return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+                }
+
+                nint num2 = Marshal.AllocHGlobal(returnLength);
+                try
+                {
+                    if (!GetTokenInformation(tokenHandle, 25, num2, returnLength, out var _))
+                    {
+                        return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+                    }
+
+                    TokenMandatoryLabel tokenMandatoryLabel = Marshal.PtrToStructure<TokenMandatoryLabel>(num2);
+                    if (tokenMandatoryLabel.Label.Sid == IntPtr.Zero)
+                    {
+                        return ProcessIntegrityInfo.Unknown(0);
+                    }
+
+                    nint sidSubAuthorityCount = GetSidSubAuthorityCount(tokenMandatoryLabel.Label.Sid);
+                    if (sidSubAuthorityCount == IntPtr.Zero)
+                    {
+                        return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+                    }
+
+                    byte b = Marshal.ReadByte(sidSubAuthorityCount);
+                    if (b == 0)
+                    {
+                        return ProcessIntegrityInfo.Unknown(0);
+                    }
+
+                    nint sidSubAuthority = GetSidSubAuthority(tokenMandatoryLabel.Label.Sid, (uint)(b - 1));
+                    if (sidSubAuthority == IntPtr.Zero)
+                    {
+                        return ProcessIntegrityInfo.Unknown(Marshal.GetLastWin32Error());
+                    }
+
+                    return ProcessIntegrityInfo.FromRid((uint)Marshal.ReadInt32(sidSubAuthority));
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(num2);
+                }
+            }
+            finally
+            {
+                CloseHandle(tokenHandle);
+            }
+        }
+        finally
+        {
+            CloseHandle(num);
+        }
+    }
+
+    internal static string? FindNeteaseBoxExecutable()
+    {
+        string text = ExtractExecutable(Registry.ClassesRoot.OpenSubKey("HSAng\\shell\\open\\command")?.GetValue(null)?.ToString());
+        string text2 = (string.IsNullOrWhiteSpace(text) ? null : Path.GetDirectoryName(text));
+        string text3 = (string.IsNullOrWhiteSpace(text2) ? null : Path.Combine(text2, "HSAng.exe"));
+        if (File.Exists(text3))
+        {
+            return text3;
+        }
+
+        foreach (string item in KnownInstallCandidates())
+        {
+            if (File.Exists(item))
+            {
+                return item;
+            }
+        }
+
+        RegistryHive[] array = new RegistryHive[2]
+        {
+            RegistryHive.CurrentUser,
+            RegistryHive.LocalMachine
+        };
+        foreach (RegistryHive hKey in array)
+        {
+            RegistryView[] array2 = new RegistryView[2]
+            {
+                RegistryView.Registry64,
+                RegistryView.Registry32
+            };
+            foreach (RegistryView view in array2)
+            {
+                try
+                {
+                    using RegistryKey registryKey = RegistryKey.OpenBaseKey(hKey, view);
+                    using RegistryKey registryKey2 = registryKey.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+                    if (registryKey2 == null)
+                    {
+                        continue;
+                    }
+
+                    string[] subKeyNames = registryKey2.GetSubKeyNames();
+                    foreach (string name in subKeyNames)
+                    {
+                        using RegistryKey registryKey3 = registryKey2.OpenSubKey(name);
+                        string text4 = registryKey3?.GetValue("DisplayName")?.ToString() ?? "";
+                        if (text4.Contains("炉石传说盒子", StringComparison.OrdinalIgnoreCase) || text4.Contains("HSAng", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string text5 = registryKey3?.GetValue("InstallLocation")?.ToString();
+                            string text6 = (string.IsNullOrWhiteSpace(text5) ? null : Path.Combine(text5, "HSAng.exe"));
+                            if (File.Exists(text6))
+                            {
+                                return text6;
+                            }
+
+                            string text7 = ExtractExecutable(registryKey3?.GetValue("DisplayIcon")?.ToString());
+                            if (File.Exists(text7) && string.Equals(Path.GetFileName(text7), "HSAng.exe", StringComparison.OrdinalIgnoreCase))
+                            {
+                                return text7;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> KnownInstallCandidates()
+    {
+        string[] source = new string[3]
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            "D:\\GameData\\炉石传说盒子"
+        };
+        foreach (string root in source.Where((string value) => !string.IsNullOrWhiteSpace(value)))
+        {
+            yield return Path.Combine(root, "炉石传说盒子", "HSAng.exe");
+            yield return Path.Combine(root, "Netease", "HSAng", "HSAng.exe");
+            if (root.EndsWith("炉石传说盒子", StringComparison.OrdinalIgnoreCase))
+            {
+                yield return Path.Combine(root, "HSAng.exe");
+            }
+        }
+    }
+
+    private static string? ExtractExecutable(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return null;
+        }
+
+        string text = command.Trim();
+        if (text.StartsWith('"'))
+        {
+            int num = text.IndexOf('"', 1);
+            if (num <= 1)
+            {
+                return null;
+            }
+
+            return text.Substring(1, num - 1);
+        }
+
+        int num2 = text.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        if (num2 < 0)
+        {
+            return null;
+        }
+
+        return text.Substring(0, num2 + 4).Trim();
+    }
+
+    private static string? TryGetProcessPath(Process process)
+    {
+        try
+        {
+            string text = process.MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+        catch
+        {
+        }
+
+        nint num = OpenProcess(4096u, inheritHandle: false, process.Id);
+        if (num == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        try
+        {
+            int size = 32768;
+            StringBuilder stringBuilder = new StringBuilder(size);
+            return (QueryFullProcessImageName(num, 0, stringBuilder, ref size) && stringBuilder.Length > 0) ? stringBuilder.ToString() : null;
+        }
+        finally
+        {
+            CloseHandle(num);
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(nint processHandle, uint desiredAccess, out nint tokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(nint tokenHandle, int tokenInformationClass, nint tokenInformation, int tokenInformationLength, out int returnLength);
+    [DllImport("advapi32.dll")]
+    private static extern nint GetSidSubAuthorityCount(nint sid);
+    [DllImport("advapi32.dll")]
+    private static extern nint GetSidSubAuthority(nint sid, uint subAuthority);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(nint process, int flags, StringBuilder executableName, ref int size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadProcessMemory(nint process, nint baseAddress, [Out] byte[] buffer, nuint size, out nuint bytesRead);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nuint VirtualQueryEx(nint process, nint address, out MemoryBasicInformation buffer, nuint length);
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint handle);
+}

@@ -1,0 +1,9 @@
+# HS Auto Open Source Glass
+**/bin/
+**/obj/
+/vendor/
+/artifacts/
+/evidence/**/*.initial
+/evidence/snapshots/
+*.user
+*.suo

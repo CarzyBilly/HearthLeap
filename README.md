@@ -79,7 +79,7 @@ Game assemblies, the BepInEx runtime, and other third-party binaries are not inc
 ### 中文
 
 ```powershell
-git clone https://github.com/CarzyBilly/HearthLeap.git
+git clone <你的仓库地址>
 cd HearthLeap
 dotnet restore
 dotnet build .\src\HsAuto -c Release
@@ -96,7 +96,7 @@ dotnet build .\src\HsAuto -c Release
 ### English
 
 ```powershell
-git clone https://github.com/CarzyBilly/HearthLeap.git
+git clone <your-repository-url>
 cd HearthLeap
 dotnet restore
 dotnet build .\src\HsAuto -c Release
@@ -132,6 +132,7 @@ docs/               # 使用说明 / documentation
 
 - [`docs/使用说明.txt`](docs/使用说明.txt)
 - [`docs/0.1.8-修复与时间设置.txt`](docs/0.1.8-修复与时间设置.txt)
+- [`docs/代码级安全与防御说明.txt`](docs/代码级安全与防御说明.txt)
 - [`PROVENANCE.md`](PROVENANCE.md)
 - [`LICENSE`](LICENSE)
 
