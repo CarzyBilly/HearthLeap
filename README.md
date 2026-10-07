@@ -39,17 +39,17 @@ HearthLeap is a Windows desktop assistant focused on a clear interface, player i
 ### 玩家档案 / Player Profile
 ![玩家档案 / Player Profile](docs/screenshots/screenshot-1.png)
 
-### 引擎设置 / Engine Settings
-![引擎设置 / Engine Settings](docs/screenshots/screenshot-2.png)
+### 引擎设置·常用设置 / Engine Settings · Common Settings
+![常用设置 / Common Settings](docs/screenshots/screenshot-2.png)
 
-### 运行偏好 / Runtime Preferences
-![运行偏好 / Runtime Preferences](docs/screenshots/screenshot-3.png)
+### 投降与轮换 / Concede and Rotation
+![投降与轮换 / Concede and Rotation](docs/screenshots/screenshot-3.png)
+
+### 段位与恢复 / Rank and Recovery
+![段位与恢复 / Rank and Recovery](docs/screenshots/screenshot-4.png)
 
 ### 时间设置 / Time Settings
-![时间设置 / Time Settings](docs/screenshots/screenshot-4.png)
-
-### 运行状态 / Runtime Status
-![运行状态 / Runtime Status](docs/screenshots/screenshot-5.png)
+![时间设置 / Time Settings](docs/screenshots/screenshot-5.png)
 
 ### 对战分析 / Match Analysis
 ![对战分析 / Match Analysis](docs/screenshots/screenshot-6.png)
