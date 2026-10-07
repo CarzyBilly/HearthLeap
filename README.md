@@ -131,8 +131,6 @@ docs/               # 使用说明 / documentation
 ## 📚 文档 / Documentation
 
 - [`docs/使用说明.txt`](docs/使用说明.txt)
-- [`docs/0.1.8-修复与时间设置.txt`](docs/0.1.8-修复与时间设置.txt)
-- [`docs/代码级安全与防御说明.txt`](docs/代码级安全与防御说明.txt)
 - [`PROVENANCE.md`](PROVENANCE.md)
 - [`LICENSE`](LICENSE)
 
